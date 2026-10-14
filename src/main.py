@@ -9,6 +9,8 @@ import uvicorn
 from src.api.app import app
 from src.bot.instance import bot, dp
 from src.config import settings
+from src.db.seed import seed_initial_data
+from src.db.session import init_db
 
 logging.basicConfig(
     level=logging.DEBUG if settings.DEBUG else logging.INFO,
@@ -43,7 +45,11 @@ async def run_bot() -> None:
 
 
 async def main() -> None:
-    """Initialize services and manage concurrent lifecycle and signals."""
+    """Initialize database, seed data, and manage concurrent services with graceful signal shutdown."""
+    logger.info("Initializing database schema and initial data...")
+    await init_db()
+    await seed_initial_data()
+
     config = uvicorn.Config(
         app=app,
         host=settings.API_HOST,
