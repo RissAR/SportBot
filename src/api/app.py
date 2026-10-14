@@ -1,9 +1,11 @@
 """FastAPI backend with CORS, TMA Anti-Cache headers, and REST API routing."""
 
 import logging
+import os
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.api.routes import admin, cycle, users, weight, workout
@@ -96,3 +98,11 @@ app.include_router(cycle.router, prefix="/api/cycle", tags=["Cycle"])
 app.include_router(workout.router, prefix="/api/workout", tags=["Workout"])
 app.include_router(weight.router, prefix="/api/weight", tags=["Weight"])
 app.include_router(admin.router, prefix="/api/admin", tags=["Admin"])
+
+
+# ---------------------------------------------------------
+# Static Frontend Distribution (Telegram Mini App SPA)
+# ---------------------------------------------------------
+frontend_dist = os.path.join(os.getcwd(), "frontend", "dist")
+if os.path.exists(frontend_dist):
+    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")

@@ -7,7 +7,10 @@ export default {
   theme: {
     extend: {
       colors: {
-        obsidian: "#07040d",
+        obsidian: "#0c0d12",
+        graphite: "#0c0d12",
+        anthracite: "#151720",
+        cardborder: "#222533",
       },
     },
   },
