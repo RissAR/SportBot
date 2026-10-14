@@ -1,137 +1,161 @@
-# ТЕХНІЧНЕ ЗАВДАННЯ: Фаза 0. Фундамент, Docker-каркас, Anti-Cache та асинхронний запуск
+# ТЕХНІЧНЕ ЗАВДАННЯ: Фаза 1. База даних, реляційні моделі та ядро 30-денної програми калістеніки
 
 ## 1. Мета та огляд
-Створити первинний каркас проекту `SportBot` згідно з архітектурною методологією. Забезпечити паралельний асинхронний запуск FastAPI та aiogram 3, захищений від кешу роутинг для Telegram Mini App, сувору ізоляцію секретів через pydantic-settings та готовність до деплою в Docker.
+Створити асинхронну реляційну базу даних на базі SQLAlchemy 2.0 (asyncio + aiosqlite), реалізувати схему моделей для атлетів, вправ з власною вагою, 3 рівнів складності, 30-денного циклу тренувань та щомісячної фіксації ваги. Написати ідемпотентний сід-скрипт (`src/db/seed.py`), який заповнить базу всіма 30 днями та повним каталогом вправ за програмою.
 
 ---
 
-## 2. Структура файлів проекту
+## 2. Структура нових файлів
 
-Необхідно реалізувати наступну архітектурну структуру:
 ```text
-/home/dofi/Dev/SportBot/
-├── .agents/
-│   ├── current_task.md
-│   └── skills/execute-task/SKILL.md
-├── .env.example
-├── .gitignore
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt
-├── data/                    # Монтується в Docker (для SQLite бази)
-├── backups/                 # Для щоденних автобекапів
-├── docs/
-│   └── ARCHITECTURE_ROADMAP.md
-├── src/
-│   ├── __init__.py
-│   ├── config.py            # Pydantic Settings, Zero Hardcoded Secrets
-│   ├── main.py              # Точка входу: паралельний запуск API + Bot
-│   ├── api/
-│   │   ├── __init__.py
-│   │   └── app.py           # FastAPI застосунок з Anti-Cache заголовками
-│   └── bot/
-│       ├── __init__.py
-│       └── instance.py      # Ініціалізація aiogram Bot та Dispatcher
-└── frontend/                # Скелет Telegram Mini App (Vite + React + Tailwind)
-    ├── package.json
-    ├── vite.config.ts
-    ├── tsconfig.json
-    ├── tailwind.config.js
-    ├── postcss.config.js
-    ├── index.html
-    └── src/
-        ├── App.tsx
-        ├── main.tsx
-        └── index.css
+src/
+└── db/
+    ├── __init__.py
+    ├── session.py       # async engine, aiosqlite, WAL режим, init_db()
+    ├── models.py        # Реляційні моделі SQLAlchemy 2.0
+    └── seed.py          # Сід-скрипт 30-денного циклу та калістенічних вправ
 ```
 
 ---
 
 ## 3. Покрокові технічні вимоги
 
-### БЛОК 1. Залежності та конфігурація (`requirements.txt`, `src/config.py`)
-1. **`requirements.txt`:**
-   - `fastapi>=0.110.0`
-   - `uvicorn[standard]>=0.28.0`
-   - `pydantic-settings>=2.2.0`
-   - `aiogram>=3.4.0`
-   - `sqlalchemy>=2.0.0`
-   - `aiosqlite>=0.20.0`
-2. **`src/config.py` (Zero Hardcoded Secrets):**
-   - Використати `pydantic_settings.BaseSettings`.
-   - `BOT_TOKEN: str = ""` (значення виключно з `.env`).
-   - `WEBAPP_URL: str = "http://localhost:3000"` (дефолт для локального тестування).
-   - Функція версіонування TMA для обходу кешу:
-     ```python
-     def get_webapp_url(self, version: str = "1.0.0") -> str:
-         delimiter = "&" if "?" in self.WEBAPP_URL else "?"
-         return f"{self.WEBAPP_URL}{delimiter}v={version}"
-     ```
-   - `DATABASE_URL: str = "sqlite+aiosqlite:///data/sportbot.db"`
-   - `API_HOST: str = "0.0.0.0"`
-   - `API_PORT: int = 8000`
-   - `DEBUG: bool = False`
-   - `CYCLE_DAYS: int = 30` (зафіксована довжина тренувального циклу).
+### БЛОК 1. Сесії БД та SQLite WAL конфігурація (`src/db/session.py`)
+1. Використовувати `settings.DATABASE_URL` (за замовчуванням `sqlite+aiosqlite:///data/sportbot.db`).
+2. Створити `create_async_engine(settings.DATABASE_URL, echo=settings.DEBUG)`.
+3. Реалізувати слухач з'єднання (`connect`) для активації режиму високої надійності та паралелізму SQLite:
+   ```python
+   from sqlalchemy import event
 
-### БЛОК 2. Бекенд API та Anti-Cache (`src/api/app.py`)
-1. Створити екземпляр `FastAPI(title="SportBot API", version="1.0.0")`.
-2. Додати CORS middleware (дозволити запити для Mini App).
-3. Додати `/health` ендпоінт для моніторингу Docker (повертає `{"status": "ok"}`).
-4. Реалізувати Middleware або заголовки проти кешування для роутів `/app*`:
-   - `Cache-Control: no-cache, no-store, must-revalidate`
-   - `Pragma: no-cache`
-   - `Expires: 0`
-   Це намертво захищає Mini App від проблеми «білого екрана» через старий кеш у Telegram.
+   @event.listens_for(engine.sync_engine, "connect")
+   def set_sqlite_pragma(dbapi_connection, connection_record):
+       cursor = dbapi_connection.cursor()
+       cursor.execute("PRAGMA journal_mode=WAL")
+       cursor.execute("PRAGMA busy_timeout=5000")
+       cursor.execute("PRAGMA synchronous=NORMAL")
+       cursor.close()
+   ```
+4. Надати асинхронний контекстний менеджер/генератор `get_db_session()` через `async_sessionmaker(expire_on_commit=False)`.
+5. Функція `init_db()`: створення всіх таблиць (`Base.metadata.create_all`).
 
-### БЛОК 3. Telegram Bot Skeleton (`src/bot/instance.py`)
-1. Ініціалізація `Bot(token=settings.BOT_TOKEN)` та `Dispatcher()`.
-2. Базовий роутер із командою `/start`:
-   - Якщо `BOT_TOKEN` порожній або не заданий — бот логує попередження і коректно пропускає запуск, не крашачи API бекенд.
-   - Вітальне повідомлення з інлайн-кнопкою або кнопкою меню, яка веде на `settings.get_webapp_url()`.
+### БЛОК 2. Моделі бази даних (`src/db/models.py`)
+Всі моделі наслідуються від `DeclarativeBase`. Англійські найменування сутностей:
 
-### БЛОК 4. Точка входу та паралельний запуск (`src/main.py`)
-1. Реалізувати паралельний асинхронний запуск через `asyncio.gather()`:
-   - `run_api()` — Uvicorn сервер.
-   - `run_bot()` — `dp.start_polling(bot)` (тільки якщо вказано валідний токен).
-2. Обробка сигналів `SIGINT` та `SIGTERM` для коректного Graceful Shutdown без витоку ресурсів.
+1. **`User` (таблиця `users`):**
+   - `id`: Integer, Primary Key.
+   - `telegram_id`: BigInteger, unique, indexed, nullable=False.
+   - `username`: String(64), nullable=True.
+   - `current_day`: Integer, default=1 (діапазон 1..30).
+   - `current_cycle`: Integer, default=1.
+   - `difficulty_mode`: String(16), default="medium" ('light', 'medium', 'hard').
+   - `created_at`: DateTime(timezone=True), server_default=func.now().
+   - `updated_at`: DateTime(timezone=True), onupdate=func.now().
 
-### БЛОК 5. Dockerfile та docker-compose.yml
-1. **`Dockerfile`:**
-   - Базовий образ `python:3.11-slim`.
-   - Створення директорій `/app/data` та `/app/backups`.
-   - Встановлення залежностей через `pip install --no-cache-dir -r requirements.txt`.
-   - `EXPOSE 8000`.
-   - Запуск `python -m src.main`.
-2. **`docker-compose.yml`:**
-   - Сервіс `sportbot_app`.
-   - Монтування томів:
-     - `./data:/app/data`
-     - `./backups:/app/backups`
-   - Порти `8000:8000`.
-   - `restart: unless-stopped`.
-   - Ротація логів (`max-size: "10m"`, `max-file: "3"`).
+2. **`Exercise` (таблиця `exercises`):**
+   - `id`: Integer, Primary Key.
+   - `slug`: String(64), unique, indexed (напр: `dips`, `decline_pushups`, `pike_pushups`, `pullups`, `chinups`, `horizontal_rows`, `toes_to_bar`, `l_sit_bars`, `bulgarian_split_squats`, `cossack_squats`, `running_intervals`, `running_zone2`).
+   - `name`: String(128) (English, напр: "Parallel Bar Dips").
+   - `category`: String(32) ('push', 'pull', 'legs', 'core', 'cardio').
+   - `metric_type`: String(16) ('reps', 'seconds', 'minutes').
+   - `description`: Text (English: правильна біомеханіка, техніка виконання).
+   - `technique_tips`: Text (English: акценти, захист суглобів при 85 кг, депресія лопаток, кут ліктів 45°).
 
-### БЛОК 6. Скелет Telegram Mini App (`frontend/`)
-1. Налаштувати структуру `frontend` на базі React 18 / Vite / TypeScript / Tailwind CSS.
-2. Стилістика (Aggressive Dark Theme):
-   - Фони: глибокий обсидіан / темний фіолетовий градієнт (`bg-gradient-to-br from-[#07040d] via-[#100822] to-[#16072b]`).
-   - Кнопки: червоний вогняний градієнт (`from-red-600 to-rose-700 hover:from-red-500 hover:to-rose-600`).
-   - Текст: білий та сріблясто-сірий.
-3. Екран-заглушка `App.tsx`:
-   - Дотримання **Rules of Hooks** (всі хуки зверху).
-   - Заголовок: **SPORTBOT // 30-DAY BODYWEIGHT CYCLE**.
-   - Бейджі: «30 Days Cycle», «3 Difficulty Modes: Light / Medium / Hard», «Weight Tracking».
-   - Кнопка з тактильним відгуком (Haptic Feedback) при натисканні (якщо запущено всередині Telegram WebApp).
+3. **`ExerciseProgression` (таблиця `exercise_progressions`):**
+   - `id`: Integer, Primary Key.
+   - `exercise_id`: Integer, ForeignKey('exercises.id', ondelete='CASCADE').
+   - `difficulty_tier`: String(16) ('light', 'medium', 'hard').
+   - `progression_name`: String(128) (напр: 'Straight Bar Dips', 'Archer Push-ups', 'Elevated Pike', 'L-Sit Pull-ups').
+   - `target_sets`: Integer (напр. 3 або 4).
+   - `target_value`: Integer (кількість повторень, секунд або хвилин).
+   - `tempo`: String(16), default="3-1-1" (темп руху для гіпертрофії та безпеки).
+   - `rest_seconds`: Integer, default=60 (рекомендований відпочинок між сетами).
+
+4. **`CycleDay` (таблиця `cycle_days`):**
+   - `id`: Integer, Primary Key.
+   - `day_number`: Integer, unique, indexed (від 1 до 30).
+   - `block_type`: String(32) ('A_PUSH', 'B_PULL', 'C_LEGS_RUN', 'REST').
+   - `title`: String(128) (напр: 'Day 1: Upper Body Push', 'Day 4: Full Recovery').
+   - `focus_areas`: String(128) (напр: 'Chest, Shoulders & Triceps').
+   - `is_rest_day`: Boolean, default=False.
+
+5. **`CycleDayExercise` (таблиця `cycle_day_exercises`):**
+   - `id`: Integer, Primary Key.
+   - `cycle_day_id`: Integer, ForeignKey('cycle_days.id', ondelete='CASCADE').
+   - `exercise_id`: Integer, ForeignKey('exercises.id', ondelete='CASCADE').
+   - `order`: Integer, default=1.
+
+6. **`WorkoutLog` (таблиця `workout_logs`):**
+   - `id`: Integer, Primary Key.
+   - `user_id`: Integer, ForeignKey('users.id', ondelete='CASCADE'), indexed=True.
+   - `cycle_number`: Integer.
+   - `day_number`: Integer.
+   - `difficulty_mode`: String(16).
+   - `duration_seconds`: Integer, default=0.
+   - `completed_at`: DateTime(timezone=True), server_default=func.now().
+
+7. **`WorkoutExerciseLog` (таблиця `workout_exercise_logs`):**
+   - `id`: Integer, Primary Key.
+   - `workout_log_id`: Integer, ForeignKey('workout_logs.id', ondelete='CASCADE').
+   - `exercise_id`: Integer, ForeignKey('exercises.id').
+   - `sets_completed`: Integer.
+   - `value_completed`: Integer (фактичні reps / seconds).
+   - `is_completed`: Boolean, default=True.
+
+8. **`WeightLog` (таблиця `weight_logs`):**
+   - `id`: Integer, Primary Key.
+   - `user_id`: Integer, ForeignKey('users.id', ondelete='CASCADE'), indexed=True.
+   - `cycle_number`: Integer.
+   - `weight_kg`: Float.
+   - `logged_at`: DateTime(timezone=True), server_default=func.now().
 
 ---
 
-## 4. Критерії приймання та верифікація (Acceptance Criteria)
-1. **Синтаксична цілісність:**
-   `python3 -m py_compile src/config.py src/main.py src/api/app.py src/bot/instance.py` виконується без жодної помилки.
-2. **Безпека:**
-   У репозиторії відсутні будь-які захардкоджені токени. Файл `.env` залишається в `.gitignore`.
-3. **Готовність контейнеризації:**
-   Файли `Dockerfile` та `docker-compose.yml` синтаксично валідні.
+### БЛОК 3. Сід-скрипт 30-денної програми (`src/db/seed.py`)
+Реалізувати асинхронну функцію `seed_initial_data()`, яка перевіряє наявність даних і наповнює базу:
+
+1. **12 Базових вправ (`exercises`) із точними описами та порадами:**
+   - **Push:**
+     - `dips`: Parallel Bar Dips (45° angle, hollow core).
+     - `decline_pushups`: Decline Push-ups (feet on 30-50cm bench, upper chest & front delts).
+     - `pike_pushups`: Pike Push-ups (L-shape body, triangle push trajectory for shoulders).
+   - **Pull & Core:**
+     - `pullups`: Pull-ups overhand (active scapular depression, chest to bar).
+     - `chinups`: Chin-ups underhand (peak biceps contraction).
+     - `horizontal_rows`: Australian Rows (neutral/overhand, protects rotator cuff against heavy pushing).
+     - `toes_to_bar`: Hanging Toes-to-Bar (controlled core flexion without swing).
+     - `l_sit_bars`: L-Sit on Parallel Bars (isometric core & hip flexor hold, 15-25s).
+   - **Legs & Cardio:**
+     - `bulgarian_split_squats`: Bulgarian Split Squats (deep single-leg load without spinal compression).
+     - `cossack_squats`: Cossack Squats (hip mobility, adductors & knee ligament resilience).
+     - `running_intervals`: Interval Running (60s high-intensity sprint + 90s walk recovery).
+     - `running_zone2`: Steady Zone 2 Tempo Run (25-30 min nose-breathing aerobic recovery).
+
+2. **Прогресії складності (`exercise_progressions`):**
+   - Для кожної вправи заповнити `light`, `medium`, `hard` рівні з відповідними `target_sets`, `target_value` (до 20 повторень для сили/маси згідно з ТЗ), `tempo="3-1-1"` та `rest_seconds=60`.
+
+3. **Генерація 30 Днів Циклу (`cycle_days` та зв'язок `cycle_day_exercises`):**
+   - Реалізувати через формулу ротації:
+     - `day % 4 == 1` ➔ `A_PUSH` (вправи: dips, decline_pushups, pike_pushups).
+     - `day % 4 == 2` ➔ `B_PULL` (вправи: pullups, chinups, horizontal_rows, toes_to_bar, l_sit_bars).
+     - `day % 4 == 3` ➔ `C_LEGS_RUN` (вправи: bulgarian_split_squats, cossack_squats + біг: якщо непарний день ніг — `running_intervals`, якщо парний — `running_zone2`).
+     - `day % 4 == 0` ➔ `REST` (`is_rest_day=True`, без вправ, заголовок "Full Recovery & Mobility").
+
+4. **Точка виклику:**
+   - Додати блок `if __name__ == "__main__": asyncio.run(seed_initial_data())` для запуску через CLI.
+   - Інтегрувати виклик `init_db()` та `seed_initial_data()` в подію старту програми у `src/main.py`.
+
+---
+
+## 4. Критерії приймання та перевірки (Acceptance Criteria)
+1. **Синтаксис та компіляція:**
+   `python3 -m py_compile src/db/session.py src/db/models.py src/db/seed.py src/main.py` проходить без помилок.
+2. **Сідінг бази даних:**
+   Команда `python3 -m src.db.seed` успішно створює файл бази `data/sportbot.db` і наповнює її.
+3. **Цілісність даних:**
+   Перевірочний запит підтверджує:
+   - 30 записів у `cycle_days` (з них 23 активних, 7 днів `is_rest_day=True`).
+   - 12 записів у `exercises`.
+   - 36 записів у `exercise_progressions` (по 3 на кожну вправу).
 4. **Формат звіту:**
-   Надати список створених файлів та єдину команду для коміту:
+   Надати список модифікованих/створених файлів та єдину команду git:
    `git add . && git commit -m "..." && git push origin main`.
