@@ -1,105 +1,164 @@
-# ТЕХНІЧНЕ ЗАВДАННЯ: Кардинальний редизайн UI/UX — Clean Athletic Dark (Whoop / Apple Fitness Style)
+# ТЕХНІЧНЕ ЗАВДАННЯ: Фаза 5. Автономність, Автобекапи, Фоновий воркер сповіщень та Продакшен-деплой (Hardening & Longevity)
 
 ## 1. Мета та огляд
-Усунути візуальний шум, перевантаженість та розфокус інтерфейсу. Перетворити Mini App із технічного дашборду на преміальний, спокійний, високоергономічний спортивний продукт (стилістика Stealth Dark):
-1. **Хедер:** Повністю прибрати логотип `SB`, технічний напис `SPORTBOT // 30-DAY CYCLE` та рядок юзернейма `dev_user_...`. Зробити тонкий, елегантний статус-рядок в один рядок: `Cycle 1 • Day X of 30` + компактний чіп вибору складності, який не вилазить за краї.
-2. **Календар:** Прибрати довгі обрізані списки м'язів (`Chest, Shoulders & Tr...`), які псують вигляд. Залишити виключно чисті дані: `Day X`, назву блоку (`PUSH`, `PULL`, `LEGS`, `REST`) та кількість вправ (`5 Exercises` або `Rest Day`).
-3. **Екран тренування (Workout):** Повне усунення візуального шуму. Прибрати зайві червоні підписи та рамки всередині рамок. Картка вправи має містити лише чітку білу назву вправи, спокійний сірий рядок параметрів (`3 sets × 6 reps • Tempo 3-1-1`) та великі зручні кнопки підходів.
-4. **Кнопка фінішу:** Прибрати емодзі вогню `🔥`. Зробити впевнену, строгу кнопку: `COMPLETE WORKOUT`.
-5. **Колірна гама:** Заспокоїти палітру. Фон — матовий глибокий графіт (`#0c0d12`), картки — солідний антрацит (`#151720`) із ледь помітним контуром (`#222533`). 90% тексту — нейтральний білий та м'який сірий. Червоний колір — виключно для активних дій (виконаний сет, фініш, таймер).
+Забезпечити 100% автономність системи `SportBot` для багаторічної безперебійної роботи на сервері (Zero-Maintenance):
+1. **Фоновий воркер щоденних нагадувань (`ReminderWorker`):** Автоматичний щоденний пуш у Telegram атлетам, які ще не завершили поточне тренування, із захистом від повторного спаму (не більше 1 пуша на день).
+2. **Автоматичні щоденні бекапи SQLite (`BackupWorker`):** Нативний гарячий бекап через `VACUUM INTO` у `/app/backups` із ротацією (зберігаються останні 7 копій) та періодичний скид журналу `wal_checkpoint`.
+3. **Мультистейдж `Dockerfile` (All-in-One):** Єдиний Docker-образ, що самостійно збирає фронтенд на базі Node 20 та запускає бекенд на Python 3.11. Розгортання зводиться до єдиної команди: `docker compose up -d --build`.
+4. **Docker Healthcheck та Graceful Shutdown:** Самовідновлення контейнера при зависанні та коректне закриття з'єднань із базою даних при `SIGTERM` / `SIGINT`.
+5. **Документація з експлуатації (`README.md`):** Чітка інструкція розгортання та керування проектом.
 
 ---
 
-## 2. Покрокові технічні вимоги
+## 2. Структура нових та оновлюваних файлів
 
-### БЛОК 1. Мінімалістичний хедер (`frontend/src/App.tsx`)
-1. **Видалити з верхньої плашки:**
-   - Червоний кружок із літерами `SB`.
-   - Заголовок `SPORTBOT // 30-DAY CYCLE`.
-   - Рядок з юзернеймом `Athlete: dev_user_8607080614`.
-2. **Створити новий лаконічний статус-рядок (висота ~40px):**
-   ```tsx
-   <header className="flex items-center justify-between px-4 py-3 border-b border-zinc-800/40 bg-zinc-950/60 backdrop-blur-md sticky top-0 z-20">
-     <div className="flex items-center gap-2">
-       <span className="text-sm font-semibold text-white">Cycle {user?.current_cycle || 1}</span>
-       <span className="text-xs text-zinc-500">•</span>
-       <span className="text-xs font-medium text-zinc-400">Day {user?.current_day || 1} of 30</span>
-     </div>
-     {/* Компактний перемикач складності без переповнення */}
-     <div className="flex items-center bg-zinc-900 border border-zinc-800 rounded-lg p-0.5 text-xs">
-       {(['Light', 'Medium', 'Hard'] as const).map((mode) => (
-         <button
-           key={mode}
-           onClick={() => handleDifficultyChange(mode)}
-           className={`px-2 py-1 rounded font-medium transition-all ${
-             user?.difficulty_mode.toLowerCase() === mode.toLowerCase()
-               ? 'bg-zinc-700 text-white shadow-sm'
-               : 'text-zinc-400 hover:text-zinc-200'
-           }`}
-         >
-           {mode}
-         </button>
-       ))}
-     </div>
-   </header>
-   ```
-   *Результат:* Нічого не вилазить за межі, екран не захаращений, видно лише потрібний контекст.
+```text
+/home/dofi/Dev/SportBot/
+├── Dockerfile                   # Оновлений мультистейдж білд (Node 20 -> Python 3.11)
+├── docker-compose.yml           # Healthcheck, ліміти логів, restart: unless-stopped
+├── README.md                    # Інструкція з деплою та архітектури
+└── src/
+    ├── main.py                  # Інтеграція фонових воркерів та Graceful Shutdown
+    └── services/
+        ├── __init__.py
+        ├── reminder.py          # Щоденні сповіщення атлетів з перевіркою стріку
+        └── backup.py            # Гарячі бекапи SQLite, ротація 7 днів, wal_checkpoint
+```
 
 ---
 
-### БЛОК 2. Очищення та ергономіка Календаря (`frontend/src/components/CalendarTab.tsx`)
-1. **Видалити обрізані тексти:**
-   - Повністю прибрати відображення списку м'язів (`day.focus_areas`) у плитках календаря (жодних `Chest, Shoulders & Tr...`).
-2. **Нова структура плитки дня:**
-   - Верхній рядок: `Day {day_number}` ліворуч, статус праворуч (`✓` зелена іконка для завершеного, пульсуюча червона крапка для поточного, замочок `🔒` для майбутніх).
-   - Середній рядок: акуратний тег блоку: `PUSH` / `PULL` / `LEGS` / `REST` у стриманих кольорах.
-   - Нижній рядок: лаконічний підпис `5 Exercises` або `Rest Day`.
-   *Результат:* Ідеальна сітка, в якій жодне слово не обрізається, все читається миттєво.
+## 3. Покрокові технічні вимоги
+
+### БЛОК 1. Щоденний фоновий воркер нагадувань (`src/services/reminder.py`)
+1. Створити функцію `run_reminder_worker(bot: Bot, check_interval_seconds: int = 3600)`:
+   - Працює як нескінченний асинхронний цикл (`while True: await asyncio.sleep(...)`).
+   - Раз на годину перевіряє поточну годину (за замовчуванням о 09:00 локального часу або щоранку).
+   - Шукає користувачів у базі даних, у яких:
+     - Сьогодні ще **немає завершеного тренування** у `workout_logs` для поточного дня `user.current_day`.
+     - Нагадування сьогодні ще **не надсилалося** (ведення словника в пам'яті `notified_today: set[tuple[int, str]]` або перевірка дати, щоб виключити спам).
+   - Формує дружнє повідомлення англійською мовою з безпечним екрануванням:
+     ```html
+     🌅 <b>Good morning, {name}!</b>
+
+     Today is <b>Day {current_day} of 30</b>: <b>{day_title}</b>.
+     🎯 <b>Focus:</b> {focus_areas}
+
+     Stay disciplined and conquer your session!
+     ```
+   - Додає інлайн-кнопку: `🚀 Open Today's Workout` (`web_app=WebAppInfo(url=settings.get_webapp_url())`).
+   - Безпечно обробляє помилки (якщо користувач заблокував бота — логує попередження без аварійної зупинки воркера).
+   - Підтримує `asyncio.CancelledError` для коректної зупинки.
 
 ---
 
-### БЛОК 3. Фокусний та спокійний екран тренування (`frontend/src/components/WorkoutTab.tsx`)
-1. **Картка дня:**
-   - Зменшити висоту hero-блоку. Єдиний лаконічний заголовок: `Day {day}: {block_name}` (напр. `Day 2: Pull & Core`).
-   - Підзаголовок спокійним сірим кольором: `5 exercises • 50–55 min`.
-2. **Розминка та Заминка (Акордеони):**
-   - Зберегти компактні плашки в 1 рядок:
-     `⚡️ Warm-up (5 mobility drills • 8–10 min)` + `[✓ Done]`.
-3. **Картки вправ (De-cluttering & Focus):**
-   - Прибрати червоні підзаголовки назв прогресій (`Band-Assisted / Negative...`). Зробити їх спокійним темно-сірим текстом або показувати лише за потреби.
-   - Заголовок вправи: чіткий білий шрифт `1. Overhand Pull-ups` + маленька акуратна кнопка `[Info]` праворуч.
-   - Рядок параметрів: нейтральний сірий `text-xs text-zinc-400`:
-     `Target: 3 sets × 6 reps  •  Tempo: 3-1-1  •  Rest: 60s`.
-   - **Кнопки сетів:**
-     - Формат: зручні великі прямокутники `[ Set 1: 6 ]`, `[ Set 2: 6 ]`, `[ Set 3: 6 ]`.
-     - До натискання: спокійний матовий графіт (`bg-zinc-900 border border-zinc-800 text-zinc-300`).
-     - Після виконання: солідне червоне/рубінове тло (`bg-red-600 text-white font-bold`).
-4. **Кнопка завершення:**
-   - **Прибрати емодзі вогню `🔥`.**
-   - Текст: чіткий, впевнений, без капсу емодзі: `COMPLETE WORKOUT`.
+### БЛОК 2. Модуль автобекапів та ротації бази (`src/services/backup.py`)
+1. Створити функцію `create_db_backup(backup_dir: str = "backups", max_backups: int = 7)`:
+   - Створює директорію `backup_dir`, якщо вона відсутня.
+   - Генерує ім'я файлу з часовою міткою: `sportbot_backup_YYYYMMDD_HHMMSS.db`.
+   - Виконує **гарячий атомарний бекап** через сесію SQLAlchemy:
+     ```python
+     await session.execute(text(f"VACUUM INTO '{backup_path}'"))
+     await session.execute(text("PRAGMA wal_checkpoint(PASSIVE)"))
+     ```
+   - **Ротація бекапів:**
+     - Знаходить усі файли `sportbot_backup_*.db` у папці `backup_dir`.
+     - Сортує за датою створення.
+     - Якщо кількість перевищує `max_backups` (7) — автоматично видаляє найстаріші копії (`os.remove()`).
+2. Створити фоновий процес `run_backup_worker(interval_seconds: int = 86400)`:
+   - Запускається кожні 24 години (наприклад, щоночі о 03:00).
+   - Логує успішне створення бекапу та кількість збережених копій.
 
 ---
 
-### БЛОК 4. Загальна колірна схема (Stealth Dark Palette)
-1. **Фон додатка:** глибокий матовий графіт `#0c0d12` замість різких фіолетових градієнтів.
-2. **Фон карток:** `#151720` з делікатним контуром `#222533`.
-3. **Акцент:** прибрати червоні написи з текстів і підзаголовків. Червоний колір використовується **лише як акцент дії** (кнопка завершення, виконаний сет, таймер відпочинку).
+### БЛОК 3. Інтеграція та Graceful Shutdown (`src/main.py`)
+1. У функції `main()` зареєструвати паралельний запуск усіх сервісів через `asyncio.gather`:
+   - `run_api(server)`
+   - `run_bot()` (якщо налаштовано токен)
+   - `run_reminder_worker(bot)` (якщо бот активний)
+   - `run_backup_worker()`
+2. Обробка сигналів `SIGINT` та `SIGTERM`:
+   - Ініціювати завершення `server.should_exit = True`.
+   - Зупинити polling бота `dp.stop_polling()`.
+   - Скасувати фонові воркери (`task.cancel()`).
+   - Фінальний скид WAL-журналу: `PRAGMA wal_checkpoint(TRUNCATE)` перед закриттям процесу.
+   - Чистий вихід із кодом 0.
 
 ---
 
-### БЛОК 5. Збірка та оновлення сервера
-1. Виконати збірку: `cd frontend && npm run build`.
-2. Переконатися у відсутності помилок компіляції.
-3. Оновити файли у статичній роздачі FastAPI (порт 8000).
-4. Перевірити, що тунель Cloudflare віддає оновлений вигляд для тестування.
+### БЛОК 4. Мультистейдж `Dockerfile` (All-in-One Build)
+Оновити `Dockerfile` для повної автоматизації розгортання:
+```dockerfile
+# Stage 1: Build Frontend (Vite + React)
+FROM node:20-alpine AS frontend-builder
+WORKDIR /frontend
+COPY frontend/package*.json ./
+RUN npm install
+COPY frontend/ ./
+RUN npm run build
+
+# Stage 2: Production Python Runtime
+FROM python:3.11-slim
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /app/data /app/backups /app/frontend/dist
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ ./src/
+COPY --from=frontend-builder /frontend/dist ./frontend/dist
+
+EXPOSE 8000
+CMD ["python", "-m", "src.main"]
+```
 
 ---
 
-## 3. Критерії приймання та перевірки (Acceptance Criteria)
-1. **Хедер:** Логотип `SB`, технічні написи та юзернейм повністю видалені. Замість них — акуратний рядок `Cycle 1 • Day X of 30` та компактний чіп складності.
-2. **Календар:** Жодного обрізаного слова з трьома крапками на плитках 30 днів.
-3. **Екран тренування:** Відсутність візуальної каші. Картки вправ стримані, фокусуються на назві та підходах.
-4. **Кнопка:** Напис `COMPLETE WORKOUT` без емодзі вогню.
-5. **Кольори:** М'яка, спокійна темна тема (Stealth Dark), очі не втомлюються і не ріже контраст.
-6. **Формат звіту:** Список змінених файлів та єдина команда git:
+### БЛОК 5. Захист та Healthcheck у `docker-compose.yml`
+Оновити `docker-compose.yml`:
+- Додати блок `healthcheck`:
+  ```yaml
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 15s
+  ```
+- Політика перезапуску: `restart: unless-stopped`.
+- Монтування томів:
+  - `./data:/app/data` (збереження БД)
+  - `./backups:/app/backups` (доступ до автобекапів з хоста)
+- Ротація логів: `max-size: "10m"`, `max-file: "3"`.
+
+---
+
+### БЛОК 6. Документація розгортання (`README.md`)
+Створити лаконічний, професійний `README.md`:
+1. Опис проекту (SportBot: 30-Day Calisthenics Engine + TMA).
+2. Архітектура (FastAPI, SQLite WAL, aiogram 3, React 18, Tailwind).
+3. Покрокове розгортання на VPS:
+   - Клонування репозиторію.
+   - Створення `.env` на базі `.env.example`.
+   - Запуск: `docker compose up -d --build`.
+   - Моніторинг логів: `docker compose logs -f`.
+   - Перевірка бекапів у `./backups`.
+
+---
+
+## 4. Критерії приймання та перевірки (Acceptance Criteria)
+1. **Синтаксис та компіляція:**
+   `python3 -m py_compile src/services/*.py src/main.py` завершується з кодом 0.
+2. **Бекап-тест:**
+   Тестовий запуск `create_db_backup()` створює валідний `.db` файл у `backups/` та підтверджує роботу ротації.
+3. **Мультистейдж перевірка:**
+   `Dockerfile` синтаксично валідний і містить як збірку `frontend`, так і запуск `python`.
+4. **Готовність до деплою:**
+   `docker-compose.yml` валідний за структурою, містить надійний healthcheck та ротацію логів.
+5. **Формат звіту:**
+   Список модифікованих файлів та єдина команда git:
    `git add . && git commit -m "..." && git push origin main`.
