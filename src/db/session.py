@@ -45,6 +45,12 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
             raise
 
 
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency yielding an AsyncSession with managed commit/rollback."""
+    async with get_db_session() as session:
+        yield session
+
+
 async def init_db() -> None:
     """Initialize database tables according to SQLAlchemy DeclarativeBase schema."""
     # Ensure directory exists for sqlite database file
