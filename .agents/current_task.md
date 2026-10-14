@@ -1,161 +1,152 @@
-# ТЕХНІЧНЕ ЗАВДАННЯ: Фаза 1. База даних, реляційні моделі та ядро 30-денної програми калістеніки
+# ТЕХНІЧНЕ ЗАВДАННЯ: Фаза 2. Захищений REST API (FastAPI, Telegram HMAC-SHA256, Pydantic v2 та Race Condition Lock)
 
 ## 1. Мета та огляд
-Створити асинхронну реляційну базу даних на базі SQLAlchemy 2.0 (asyncio + aiosqlite), реалізувати схему моделей для атлетів, вправ з власною вагою, 3 рівнів складності, 30-денного циклу тренувань та щомісячної фіксації ваги. Написати ідемпотентний сід-скрипт (`src/db/seed.py`), який заповнить базу всіма 30 днями та повним каталогом вправ за програмою.
+Створити безпечний REST API бекенд на базі FastAPI, що забезпечує:
+1. Криптографічну валідацію `initData` Telegram Mini App (HMAC-SHA256) із захистом від replay-атак та безпечним DEV-фолбеком для локальної розробки.
+2. Автоматичне створення профілю атлета (JIT User Provisioning) при першому вході.
+3. Ендпоінти отримання щоденного тренування з фіксованими блоками розминки (Warm-up) та заминки (Cool-down).
+4. Суворе правило: пройдені дні доступні **лише для перегляду**; завершити можна тільки поточний активний день (`user.current_day`).
+5. Захист від подвійного тапу / стану гонитви (`asyncio.Lock` на рівні кожного користувача).
+6. Фіксацію щомісячної ваги та перехід на новий 30-денний цикл.
+7. Захищені ендпоінти метрик для адміністратора (`ADMIN_IDS`).
 
 ---
 
-## 2. Структура нових файлів
+## 2. Структура файлів API
 
 ```text
-src/
-└── db/
+src/api/
+├── __init__.py
+├── app.py               # Точка збірки FastAPI, CORS, Anti-Cache, підключення роутерів
+├── auth.py              # HMAC-SHA256 валідація Telegram initData, get_current_user, verify_admin
+├── schemas.py           # Pydantic v2 моделі запитів та відповідей (Contract First)
+└── routes/
     ├── __init__.py
-    ├── session.py       # async engine, aiosqlite, WAL режим, init_db()
-    ├── models.py        # Реляційні моделі SQLAlchemy 2.0
-    └── seed.py          # Сід-скрипт 30-денного циклу та калістенічних вправ
+    ├── users.py         # /api/user (профіль, зміна складності)
+    ├── cycle.py         # /api/cycle (тренування дня, 30-денний календар, перегляд)
+    ├── workout.py       # /api/workout/complete (фіксація тренування з asyncio.Lock)
+    ├── weight.py        # /api/weight (фіксація ваги, історія)
+    └── admin.py         # /api/admin/metrics (статистика для адміна)
 ```
 
 ---
 
 ## 3. Покрокові технічні вимоги
 
-### БЛОК 1. Сесії БД та SQLite WAL конфігурація (`src/db/session.py`)
-1. Використовувати `settings.DATABASE_URL` (за замовчуванням `sqlite+aiosqlite:///data/sportbot.db`).
-2. Створити `create_async_engine(settings.DATABASE_URL, echo=settings.DEBUG)`.
-3. Реалізувати слухач з'єднання (`connect`) для активації режиму високої надійності та паралелізму SQLite:
-   ```python
-   from sqlalchemy import event
-
-   @event.listens_for(engine.sync_engine, "connect")
-   def set_sqlite_pragma(dbapi_connection, connection_record):
-       cursor = dbapi_connection.cursor()
-       cursor.execute("PRAGMA journal_mode=WAL")
-       cursor.execute("PRAGMA busy_timeout=5000")
-       cursor.execute("PRAGMA synchronous=NORMAL")
-       cursor.close()
-   ```
-4. Надати асинхронний контекстний менеджер/генератор `get_db_session()` через `async_sessionmaker(expire_on_commit=False)`.
-5. Функція `init_db()`: створення всіх таблиць (`Base.metadata.create_all`).
-
-### БЛОК 2. Моделі бази даних (`src/db/models.py`)
-Всі моделі наслідуються від `DeclarativeBase`. Англійські найменування сутностей:
-
-1. **`User` (таблиця `users`):**
-   - `id`: Integer, Primary Key.
-   - `telegram_id`: BigInteger, unique, indexed, nullable=False.
-   - `username`: String(64), nullable=True.
-   - `current_day`: Integer, default=1 (діапазон 1..30).
-   - `current_cycle`: Integer, default=1.
-   - `difficulty_mode`: String(16), default="medium" ('light', 'medium', 'hard').
-   - `created_at`: DateTime(timezone=True), server_default=func.now().
-   - `updated_at`: DateTime(timezone=True), onupdate=func.now().
-
-2. **`Exercise` (таблиця `exercises`):**
-   - `id`: Integer, Primary Key.
-   - `slug`: String(64), unique, indexed (напр: `dips`, `decline_pushups`, `pike_pushups`, `pullups`, `chinups`, `horizontal_rows`, `toes_to_bar`, `l_sit_bars`, `bulgarian_split_squats`, `cossack_squats`, `running_intervals`, `running_zone2`).
-   - `name`: String(128) (English, напр: "Parallel Bar Dips").
-   - `category`: String(32) ('push', 'pull', 'legs', 'core', 'cardio').
-   - `metric_type`: String(16) ('reps', 'seconds', 'minutes').
-   - `description`: Text (English: правильна біомеханіка, техніка виконання).
-   - `technique_tips`: Text (English: акценти, захист суглобів при 85 кг, депресія лопаток, кут ліктів 45°).
-
-3. **`ExerciseProgression` (таблиця `exercise_progressions`):**
-   - `id`: Integer, Primary Key.
-   - `exercise_id`: Integer, ForeignKey('exercises.id', ondelete='CASCADE').
-   - `difficulty_tier`: String(16) ('light', 'medium', 'hard').
-   - `progression_name`: String(128) (напр: 'Straight Bar Dips', 'Archer Push-ups', 'Elevated Pike', 'L-Sit Pull-ups').
-   - `target_sets`: Integer (напр. 3 або 4).
-   - `target_value`: Integer (кількість повторень, секунд або хвилин).
-   - `tempo`: String(16), default="3-1-1" (темп руху для гіпертрофії та безпеки).
-   - `rest_seconds`: Integer, default=60 (рекомендований відпочинок між сетами).
-
-4. **`CycleDay` (таблиця `cycle_days`):**
-   - `id`: Integer, Primary Key.
-   - `day_number`: Integer, unique, indexed (від 1 до 30).
-   - `block_type`: String(32) ('A_PUSH', 'B_PULL', 'C_LEGS_RUN', 'REST').
-   - `title`: String(128) (напр: 'Day 1: Upper Body Push', 'Day 4: Full Recovery').
-   - `focus_areas`: String(128) (напр: 'Chest, Shoulders & Triceps').
-   - `is_rest_day`: Boolean, default=False.
-
-5. **`CycleDayExercise` (таблиця `cycle_day_exercises`):**
-   - `id`: Integer, Primary Key.
-   - `cycle_day_id`: Integer, ForeignKey('cycle_days.id', ondelete='CASCADE').
-   - `exercise_id`: Integer, ForeignKey('exercises.id', ondelete='CASCADE').
-   - `order`: Integer, default=1.
-
-6. **`WorkoutLog` (таблиця `workout_logs`):**
-   - `id`: Integer, Primary Key.
-   - `user_id`: Integer, ForeignKey('users.id', ondelete='CASCADE'), indexed=True.
-   - `cycle_number`: Integer.
-   - `day_number`: Integer.
-   - `difficulty_mode`: String(16).
-   - `duration_seconds`: Integer, default=0.
-   - `completed_at`: DateTime(timezone=True), server_default=func.now().
-
-7. **`WorkoutExerciseLog` (таблиця `workout_exercise_logs`):**
-   - `id`: Integer, Primary Key.
-   - `workout_log_id`: Integer, ForeignKey('workout_logs.id', ondelete='CASCADE').
-   - `exercise_id`: Integer, ForeignKey('exercises.id').
-   - `sets_completed`: Integer.
-   - `value_completed`: Integer (фактичні reps / seconds).
-   - `is_completed`: Boolean, default=True.
-
-8. **`WeightLog` (таблиця `weight_logs`):**
-   - `id`: Integer, Primary Key.
-   - `user_id`: Integer, ForeignKey('users.id', ondelete='CASCADE'), indexed=True.
-   - `cycle_number`: Integer.
-   - `weight_kg`: Float.
-   - `logged_at`: DateTime(timezone=True), server_default=func.now().
+### БЛОК 1. Автентифікація Telegram initData (`src/api/auth.py`)
+1. **Алгоритм валідації HMAC-SHA256:**
+   - Отримання рядка `init_data` з заголовка `Authorization: tma <init_data>` або `X-Telegram-Init-Data`.
+   - Якщо `settings.DEBUG is True` та заголовок відсутній — дозволити емуляцію через заголовок `X-Dev-Telegram-Id` або використання `settings.admin_ids_list[0]`. У продакшені (`DEBUG=False`) відхиляти всі непідписані запити (HTTP 401).
+   - Розрахунок `secret_key`:
+     `hmac.new(b"WebAppData", settings.BOT_TOKEN.encode(), hashlib.sha256).digest()`
+   - Парсинг параметрів, сортування ключів за алфавітом (виключаючи `hash`), об'єднання через `\n`.
+   - Обчислення контрольного хешу та звірка через `hmac.compare_digest`.
+   - Перевірка `auth_date` (запит не старіший за 86400 секунд).
+2. **Dependency `get_current_user`:**
+   - Витягує `telegram_id`, `username`, `first_name` з розпарсеного `user` JSON.
+   - Шукає користувача в базі даних:
+     - Якщо знайдено — повертає об'єкт `User`.
+     - Якщо користувача немає — атомарно створює нового (`telegram_id`, `username`, `current_day=1`, `current_cycle=1`, `difficulty_mode="medium"`).
+3. **Dependency `verify_admin`:**
+   - Перевіряє `user.telegram_id in settings.admin_ids_list`. Якщо ні — викликає `HTTPException(status_code=403, detail="Admin access required")`.
 
 ---
 
-### БЛОК 3. Сід-скрипт 30-денної програми (`src/db/seed.py`)
-Реалізувати асинхронну функцію `seed_initial_data()`, яка перевіряє наявність даних і наповнює базу:
+### БЛОК 2. Контракти даних (Pydantic v2 у `src/api/schemas.py`)
+Усі схеми та повідомлення строго англійською мовою:
 
-1. **12 Базових вправ (`exercises`) із точними описами та порадами:**
-   - **Push:**
-     - `dips`: Parallel Bar Dips (45° angle, hollow core).
-     - `decline_pushups`: Decline Push-ups (feet on 30-50cm bench, upper chest & front delts).
-     - `pike_pushups`: Pike Push-ups (L-shape body, triangle push trajectory for shoulders).
-   - **Pull & Core:**
-     - `pullups`: Pull-ups overhand (active scapular depression, chest to bar).
-     - `chinups`: Chin-ups underhand (peak biceps contraction).
-     - `horizontal_rows`: Australian Rows (neutral/overhand, protects rotator cuff against heavy pushing).
-     - `toes_to_bar`: Hanging Toes-to-Bar (controlled core flexion without swing).
-     - `l_sit_bars`: L-Sit on Parallel Bars (isometric core & hip flexor hold, 15-25s).
-   - **Legs & Cardio:**
-     - `bulgarian_split_squats`: Bulgarian Split Squats (deep single-leg load without spinal compression).
-     - `cossack_squats`: Cossack Squats (hip mobility, adductors & knee ligament resilience).
-     - `running_intervals`: Interval Running (60s high-intensity sprint + 90s walk recovery).
-     - `running_zone2`: Steady Zone 2 Tempo Run (25-30 min nose-breathing aerobic recovery).
-
-2. **Прогресії складності (`exercise_progressions`):**
-   - Для кожної вправи заповнити `light`, `medium`, `hard` рівні з відповідними `target_sets`, `target_value` (до 20 повторень для сили/маси згідно з ТЗ), `tempo="3-1-1"` та `rest_seconds=60`.
-
-3. **Генерація 30 Днів Циклу (`cycle_days` та зв'язок `cycle_day_exercises`):**
-   - Реалізувати через формулу ротації:
-     - `day % 4 == 1` ➔ `A_PUSH` (вправи: dips, decline_pushups, pike_pushups).
-     - `day % 4 == 2` ➔ `B_PULL` (вправи: pullups, chinups, horizontal_rows, toes_to_bar, l_sit_bars).
-     - `day % 4 == 3` ➔ `C_LEGS_RUN` (вправи: bulgarian_split_squats, cossack_squats + біг: якщо непарний день ніг — `running_intervals`, якщо парний — `running_zone2`).
-     - `day % 4 == 0` ➔ `REST` (`is_rest_day=True`, без вправ, заголовок "Full Recovery & Mobility").
-
-4. **Точка виклику:**
-   - Додати блок `if __name__ == "__main__": asyncio.run(seed_initial_data())` для запуску через CLI.
-   - Інтегрувати виклик `init_db()` та `seed_initial_data()` в подію старту програми у `src/main.py`.
+1. **Користувач:**
+   - `UserProfileResponse`: `telegram_id: int`, `username: Optional[str]`, `current_day: int`, `current_cycle: int`, `difficulty_mode: str`, `total_workouts_completed: int`, `latest_weight: Optional[float]`.
+   - `DifficultyUpdateRequest`: `difficulty_mode: Literal['light', 'medium', 'hard']`.
+2. **Розминка та Заминка (Фіксовані списки):**
+   - `WarmupStep`: `order: int`, `title: str`, `duration_seconds: int`, `description: str`.
+   - `CooldownStep`: `order: int`, `title: str`, `duration_seconds: int`, `description: str`.
+3. **Тренування та Вправи:**
+   - `ExerciseDetailResponse`: `id: int`, `slug: str`, `name: str`, `category: str`, `metric_type: str`, `progression_name: str`, `target_sets: int`, `target_value: int`, `tempo: str`, `rest_seconds: int`, `description: str`, `technique_tips: str`.
+   - `TodayWorkoutResponse`: `day_number: int`, `cycle_number: int`, `block_type: str`, `title: str`, `focus_areas: str`, `is_rest_day: bool`, `warmup_steps: list[WarmupStep]`, `exercises: list[ExerciseDetailResponse]`, `cooldown_steps: list[CooldownStep]`, `recovery_guidelines: Optional[str]`.
+   - `CycleDaySummary`: `day_number: int`, `block_type: str`, `title: str`, `focus_areas: str`, `is_rest_day: bool`, `status: Literal['completed', 'current', 'locked']`.
+   - `CycleDaysOverviewResponse`: `cycle_number: int`, `current_day: int`, `days: list[CycleDaySummary]`.
+4. **Завершення тренування:**
+   - `WorkoutExerciseInput`: `exercise_id: int`, `sets_completed: int`, `value_completed: int`, `is_completed: bool`.
+   - `WorkoutCompleteRequest`: `day_number: int`, `cycle_number: int`, `duration_seconds: int`, `difficulty_mode: str`, `exercises: list[WorkoutExerciseInput]`.
+   - `WorkoutCompleteResponse`: `success: bool`, `message: str`, `cycle_completed: bool`, `next_day: int`, `next_cycle: int`.
+5. **Вага та Метрики:**
+   - `WeightLogRequest`: `weight_kg: float`, `cycle_number: int`.
+   - `WeightLogResponse`: `id: int`, `weight_kg: float`, `cycle_number: int`, `logged_at: str`, `is_cycle_reset: bool`.
+   - `WeightHistoryResponse`: `history: list[dict]`.
+   - `AdminMetricsResponse`: `total_athletes: int`, `total_workouts_completed: int`, `difficulty_distribution: dict[str, int]`, `active_cycles_distribution: dict[int, int]`.
 
 ---
 
-## 4. Критерії приймання та перевірки (Acceptance Criteria)
-1. **Синтаксис та компіляція:**
-   `python3 -m py_compile src/db/session.py src/db/models.py src/db/seed.py src/main.py` проходить без помилок.
-2. **Сідінг бази даних:**
-   Команда `python3 -m src.db.seed` успішно створює файл бази `data/sportbot.db` і наповнює її.
-3. **Цілісність даних:**
-   Перевірочний запит підтверджує:
-   - 30 записів у `cycle_days` (з них 23 активних, 7 днів `is_rest_day=True`).
-   - 12 записів у `exercises`.
-   - 36 записів у `exercise_progressions` (по 3 на кожну вправу).
+### БЛОК 3. Маршрутизація та бізнес-правила (Routers)
+
+#### 1. `src/api/routes/users.py`
+- `GET /api/user/me`: повертає `UserProfileResponse`.
+- `PATCH /api/user/difficulty`: валідує новий режим, оновлює `user.difficulty_mode`, повертає оновлений профіль.
+
+#### 2. `src/api/routes/cycle.py`
+- `GET /api/cycle/today`:
+  - Знаходить `CycleDay` для `user.current_day`.
+  - Якщо `is_rest_day is True`: повертає `exercises=[]`, наповнені `recovery_guidelines` (гідратація, сон 8+ годин, легка прогулянка 20-30 хв).
+  - Якщо тренувальний день: підтягує вправи через `CycleDayExercise`, вибирає прогресію відповідно до `user.difficulty_mode`, повертає повну структуру з 5 кроками розминки (Wrists, Shoulders, Scapula, Hips, Knees) та 4 кроками заминки (Chest, Lats, Cat-cow, Diaphragm).
+- `GET /api/cycle/days`:
+  - Повертає статус для кожного з 30 днів:
+    - `day_number < user.current_day` ➔ `status = 'completed'`
+    - `day_number == user.current_day` ➔ `status = 'current'`
+    - `day_number > user.current_day` ➔ `status = 'locked'`
+- `GET /api/cycle/days/{day_number}`:
+  - Дозволяє переглянути деталі будь-якого дня (включаючи минулі). Лише для ознайомлення.
+
+#### 3. `src/api/routes/workout.py` (Race Condition Protection)
+- `POST /api/workout/complete`:
+  - **Критична перевірка:** `if req.day_number != user.current_day:` ➔ викликати `HTTPException(400, "Only the current day workout can be completed. Past days are view-only.")`.
+  - Застосувати блокування `asyncio.Lock` по `user.id` (наприклад, через словник блокувань `user_locks = defaultdict(asyncio.Lock)`).
+  - Перевірити, чи немає вже запису `WorkoutLog` для `(user.id, user.current_cycle, req.day_number)`.
+  - Зберегти `WorkoutLog` та детальні `WorkoutExerciseLog`.
+  - Логіка переходу днів:
+    - Якщо `user.current_day < 30`:
+      `user.current_day += 1`
+      `cycle_completed = False`
+    - Якщо `user.current_day == 30`:
+      `cycle_completed = True` (день залишається 30 до фіксації ваги).
+  - Зберегти транзакцію (`db.commit()`), повернути `WorkoutCompleteResponse`.
+
+#### 4. `src/api/routes/weight.py`
+- `POST /api/weight`:
+  - Зберігає `WeightLog(user_id=user.id, weight_kg=req.weight_kg, cycle_number=req.cycle_number)`.
+  - Якщо `user.current_day == 30`:
+    - Скидає `user.current_day = 1`.
+    - Збільшує `user.current_cycle += 1`.
+    - `is_cycle_reset = True`.
+  - Повертає `WeightLogResponse`.
+- `GET /api/weight/history`: повертає всі записи ваги користувача, впорядковані за часом.
+
+#### 5. `src/api/routes/admin.py`
+- `GET /api/admin/metrics`:
+  - Захищено `Depends(verify_admin)`.
+  - Агрегує підрахунок користувачів, логів тренувань, розподілу за складністю.
+
+---
+
+### БЛОК 4. Реєстрація у `src/api/app.py`
+- Підключити всі роутери через `app.include_router(..., prefix="/api")`.
+- Зберегти роботу Anti-Cache middleware для роутів `/app*` та CORS.
+- Додати обробку глобальних винятків для повернення чистих JSON-помилок.
+
+---
+
+## 4. Критерії приймання та верифікація (Acceptance Criteria)
+1. **Синтаксична цілісність:**
+   `python3 -m py_compile src/api/auth.py src/api/schemas.py src/api/routes/*.py src/api/app.py` завершується з кодом 0.
+2. **Тестування API:**
+   Створити та виконати тестовий скрипт (наприклад, `tests/test_api_endpoints.py`), який перевіряє:
+   - `GET /api/user/me` повертає профіль (включаючи створення нового користувача JIT).
+   - `GET /api/cycle/today` повертає тренування дня 1 із кроками Warm-up, вправами та Cool-down.
+   - `POST /api/workout/complete` успішно фіксує День 1 і переводить `user.current_day` на День 2.
+   - Спроба завершити вже пройдений День 1 повертає `400 Bad Request`.
+   - `POST /api/weight` успішно записує вагу.
+3. **Безпека:**
+   Жодних токенів у репозиторії. Неавторизований запит без `initData` при `DEBUG=False` повертає 401.
 4. **Формат звіту:**
-   Надати список модифікованих/створених файлів та єдину команду git:
+   Список створених/модифікованих файлів та єдина команда git:
    `git add . && git commit -m "..." && git push origin main`.
