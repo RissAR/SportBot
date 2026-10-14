@@ -1,45 +1,36 @@
-"""aiogram 3 bot and dispatcher setup with safe startup fallback."""
+"""aiogram 3 bot and dispatcher setup with database session middleware and modular handlers."""
 
 import logging
 from typing import Optional
 
-from aiogram import Bot, Dispatcher, Router
-from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from aiogram import Bot, Dispatcher
 
+from src.bot.handlers import admin, base, guide, progress, settings as bot_settings, workout
+from src.bot.middlewares import DbSessionMiddleware
 from src.config import settings
 
 logger = logging.getLogger("sportbot.bot")
 
-router = Router(name="base_router")
-
-
-@router.message(CommandStart())
-async def command_start_handler(message: Message) -> None:
-    """Handle /start command and present Mini App launch button."""
-    webapp_url = settings.get_webapp_url()
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔥 Open SportBot",
-                    web_app=WebAppInfo(url=webapp_url),
-                )
-            ]
-        ]
-    )
-    await message.answer(
-        "👋 Welcome to **SportBot**!\n\n"
-        "Your personal 30-day bodyweight workout cycle.\n"
-        "Tap the button below to launch the app:",
-        reply_markup=keyboard,
-        parse_mode="Markdown",
-    )
-
-
+# ---------------------------------------------------------
+# Dispatcher Initialization & Middleware Registration
+# ---------------------------------------------------------
 dp = Dispatcher()
-dp.include_router(router)
 
+# Register database session injection across messages and callback queries
+dp.message.middleware(DbSessionMiddleware())
+dp.callback_query.middleware(DbSessionMiddleware())
+
+# Include modular feature routers
+dp.include_router(base.router)
+dp.include_router(workout.router)
+dp.include_router(progress.router)
+dp.include_router(guide.router)
+dp.include_router(bot_settings.router)
+dp.include_router(admin.router)
+
+# ---------------------------------------------------------
+# Bot Instance with Safe Startup Fallback
+# ---------------------------------------------------------
 bot: Optional[Bot] = None
 if settings.BOT_TOKEN.strip():
     bot = Bot(token=settings.BOT_TOKEN)

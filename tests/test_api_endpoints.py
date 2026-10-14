@@ -68,8 +68,8 @@ async def run_all_tests() -> None:
         original_token = settings.BOT_TOKEN
         settings.BOT_TOKEN = test_bot_token
 
-        test_tg_id = 777123456
-        test_username = "test_calisthenics_pro"
+        test_tg_id = int(time.time() * 1000) % 1_000_000_000
+        test_username = f"athlete_{test_tg_id}"
         valid_init_data = generate_valid_tma_init_data(test_bot_token, test_tg_id, test_username)
 
         auth_headers = {"Authorization": f"tma {valid_init_data}"}
