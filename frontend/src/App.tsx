@@ -76,7 +76,7 @@ export const App: React.FC = () => {
   };
 
   const defaultUser: UserProfile = {
-    telegram_id: 8607080614,
+    telegram_id: 123456789,
     username: "Athlete",
     current_day: 1,
     current_cycle: 1,

@@ -66,7 +66,7 @@ const getHeaders = (): HeadersInit => {
     headers["Authorization"] = `tma ${initData}`;
   } else {
     // Fallback for direct browser testing
-    headers["X-Dev-Telegram-Id"] = "8607080614";
+    headers["X-Dev-Telegram-Id"] = "123456789";
   }
 
   return headers;
